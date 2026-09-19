@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 
+from atif import write_atif_trajectory
 from runner.agents.loop_truncated_tools_agent.main import run
 from runner.agents.models import AgentRunInput, AgentStatus
 
@@ -28,7 +29,11 @@ async def execute(args: argparse.Namespace) -> None:
             agent_config_values=config["agent_config_values"],
         )
     )
-    Path(args.output).write_text(result.model_dump_json(indent=2))
+    native_path = Path(args.output)
+    native_json = result.model_dump_json(indent=2)
+    native_path.write_text(native_json)
+    # The verifier must not depend on a host download/convert/upload round trip.
+    write_atif_trajectory(json.loads(native_json), native_path.with_name("trajectory.json"))
     if result.status in (AgentStatus.ERROR, AgentStatus.CANCELLED):
         raise RuntimeError(f"Agent execution failed; native trajectory saved to {args.output}")
 

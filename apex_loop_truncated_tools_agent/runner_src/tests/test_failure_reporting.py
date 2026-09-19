@@ -12,13 +12,14 @@ from litellm import ModelResponse
 from litellm.exceptions import BadRequestError, RateLimitError
 
 import runner_cli
+from atif import convert_trajectory
 from runner.agents.loop_truncated_tools_agent.main import LoopTruncatedToolsAgent
 from runner.agents.models import AgentRunInput, AgentStatus, AgentTrajectoryOutput
 from runner.utils import llm
 
 
 class FailureReportingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_native_execution_failures_raise_after_preserving_trajectory(self):
+    async def test_native_execution_failures_raise_after_preserving_both_trajectories(self):
         for status in (AgentStatus.ERROR, AgentStatus.CANCELLED, AgentStatus.FAILED, AgentStatus.COMPLETED):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -48,6 +49,11 @@ class FailureReportingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     json.loads(args.output.read_text()), json.loads(result.model_dump_json())
                 )
+                self.assertEqual(
+                    json.loads((root / "trajectory.json").read_text()),
+                    convert_trajectory(json.loads(result.model_dump_json())),
+                )
+                self.assertFalse((root / "trajectory.json.tmp").exists())
 
     async def test_cancelled_loop_returns_cancelled_trajectory(self):
         messages = [{"role": "user", "content": "Task"}]

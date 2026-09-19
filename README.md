@@ -96,6 +96,27 @@ harbor run \
 
 Replace the model with any LiteLLM-compatible `provider/model`.
 
+## Trajectory handoff
+
+The sandbox runner saves native output and atomically publishes `trajectory.json` in ATIF format before exiting. Verification therefore does not depend on Harbor uploading host-converted logs back to the sandbox. The host preserves downloaded ATIF, reconstructs it from readable native output for older runners, and retains damaged ATIF under `trajectory.invalid-*.json` so a partial download cannot overwrite the sandbox's complete trajectory. Missing logs do not produce a synthetic empty trajectory. This requires no Harbor core changes.
+
+Native `ERROR` and `CANCELLED` results preserve both trajectories and exit unsuccessfully; `FAILED` and `COMPLETED` retain their existing scoring behavior. A deterministic OpenAI image-patch-limit error is not retried, while transient rate limits still are. Hard process termination, sandbox loss, and subsequent artifact-transfer failures are outside this handoff fix.
+
+## Tests
+
+Run host handoff regressions in a Python environment with Harbor installed:
+
+```bash
+PYTHONPATH="$PWD/apex_loop_truncated_tools_agent" python -m unittest discover -s tests -v
+```
+
+Run the CLI status and provider-retry regressions using the frozen runner dependencies:
+
+```bash
+cd apex_loop_truncated_tools_agent/runner_src
+uv run --frozen --no-install-project python -m unittest discover -s tests -v
+```
+
 ## Citation
 
 ```bibtex

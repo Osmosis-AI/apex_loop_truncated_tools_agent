@@ -21,10 +21,14 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from uuid import uuid4
 
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
+
+from runner_src.atif import convert_trajectory as convert_trajectory
+from runner_src.atif import write_atif_trajectory
 
 _RUNNER_DIR = "/agent_runner"
 _LOG = "/logs/agent"
@@ -45,140 +49,6 @@ def _env_int(name, default):
     except ValueError:
         print(f"WARNING: ignoring non-numeric {name}={raw!r}", file=sys.stderr)
         return default
-
-
-def _text(content):
-    """Normalize message content to a string (handle content-parts lists)."""
-    if content is None:
-        return ""
-    if isinstance(content, list):
-        return " ".join(p.get("text", "") for p in content if isinstance(p, dict))
-    return str(content)
-
-
-def _args_obj(arguments):
-    """tool_call arguments arrive as a JSON string; ATIF wants an object."""
-    if isinstance(arguments, dict):
-        return arguments
-    try:
-        v = json.loads(arguments)
-        return v if isinstance(v, dict) else {"_value": v}
-    except Exception:
-        return {"_raw": str(arguments)}
-
-
-def _metrics_from_call(c):
-    if not c:
-        return None
-    m = {
-        "prompt_tokens": c.get("prompt_tokens"),
-        "completion_tokens": c.get("completion_tokens"),
-        "cached_tokens": c.get("cached_tokens"),
-    }
-    extra = {
-        k: c[k]
-        for k in ("cache_creation_tokens", "reasoning_tokens", "total_tokens")
-        if k in c
-    }
-    if extra:
-        m["extra"] = extra
-    return {k: v for k, v in m.items() if v is not None or k == "extra"}
-
-
-def convert_trajectory(traj: dict) -> dict:
-    """APEX-native trajectory -> ATIF (the harbor trajectory standard)."""
-    messages = traj.get("messages") or []
-    call_log = (traj.get("usage") or {}).get("call_log") or []
-
-    steps = []
-    a_idx = 0
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        role = msg.get("role")
-        if role in ("system", "user"):
-            steps.append(
-                {
-                    "step_id": len(steps) + 1,
-                    "source": role,
-                    "message": _text(msg.get("content")),
-                }
-            )
-            i += 1
-            continue
-        if role == "assistant":
-            step = {
-                "step_id": len(steps) + 1,
-                "source": "agent",
-                "message": _text(msg.get("content")),
-            }
-            atif_tcs = []
-            for tc in msg.get("tool_calls") or []:
-                fn = tc.get("function") or {}
-                cid = tc.get("id") or fn.get("name")
-                atif_tcs.append(
-                    {
-                        "tool_call_id": cid,
-                        "function_name": fn.get("name"),
-                        "arguments": _args_obj(fn.get("arguments")),
-                    }
-                )
-            if atif_tcs:
-                step["tool_calls"] = atif_tcs
-            mx = _metrics_from_call(call_log[a_idx] if a_idx < len(call_log) else None)
-            if mx:
-                step["metrics"] = mx
-            a_idx += 1
-            results = []
-            j = i + 1
-            while j < len(messages) and messages[j].get("role") == "tool":
-                tm = messages[j]
-                results.append(
-                    {
-                        "source_call_id": tm.get("tool_call_id"),
-                        "content": _text(tm.get("content")),
-                    }
-                )
-                j += 1
-            if results:
-                step["observation"] = {"results": results}
-            steps.append(step)
-            i = j
-            continue
-        steps.append(
-            {
-                "step_id": len(steps) + 1,
-                "source": "agent",
-                "message": _text(msg.get("content")),
-                "extra": {"native_role": role},
-            }
-        )
-        i += 1
-
-    u = traj.get("usage") or {}
-    final_metrics = {
-        k: v
-        for k, v in {
-            "total_prompt_tokens": u.get("prompt_tokens"),
-            "total_completion_tokens": u.get("completion_tokens"),
-            "total_cached_tokens": u.get("cached_tokens"),
-            "total_steps": len(steps),
-        }.items()
-        if v is not None
-    }
-    return {
-        "schema_version": "ATIF-v1.5",
-        "session_id": traj.get("session_id") or "apex-agent",
-        "agent": {"name": "apex_loop_truncated_tools_agent", "version": "1.0"},
-        "steps": steps,
-        "final_metrics": final_metrics,
-        "extra": {
-            "converted_from": "apex-native",
-            "native_status": traj.get("status"),
-            "time_elapsed_sec": traj.get("time_elapsed"),
-            "native_output": traj.get("output"),
-        },
-    }
 
 
 class ApexLoopTruncatedToolsAgent(BaseAgent):
@@ -330,7 +200,7 @@ exit $rc
                                      timeout_sec=self._agent_timeout + 900)
         tail = "\n".join(p for p in (res.stdout, res.stderr) if p)[-2000:]
         self.logger.info(f"[apex-agent] run tail:\n{tail}")
-        # The trajectory is converted and the context filled in
+        # The sandbox writes both trajectories. The context is filled in
         # populate_context_post_run: harbor calls it once /logs/agent is on the
         # host, after a successful and after a failed run alike, but only while
         # the context is still empty — so nothing is written to it here.
@@ -343,7 +213,7 @@ exit $rc
             )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
-        """Convert the synced native trajectory to ATIF and fill the context.
+        """Read the synced ATIF (or convert legacy native output) for context.
 
         harbor invokes this after /logs/agent has been synced to the host (a
         no-op when the environment bind-mounts it, a download otherwise), on
@@ -352,24 +222,41 @@ exit $rc
         """
         atif = self._write_atif_trajectory()
         context.metadata = {"tail": self._run_tail, "return_code": self._return_code}
-        metrics = atif.get("final_metrics") or {}
+        metrics = (atif or {}).get("final_metrics") or {}
         context.n_input_tokens = metrics.get("total_prompt_tokens")
         context.n_output_tokens = metrics.get("total_completion_tokens")
         context.n_cache_tokens = metrics.get("total_cached_tokens")
 
-    def _write_atif_trajectory(self) -> dict:
-        """Convert the runner's native trajectory to ATIF at the standard
-        path; an absent or unparseable native file yields an empty-steps
-        ATIF so grading judges the absence of work instead of erroring."""
+    def _write_atif_trajectory(self) -> dict | None:
+        """Preserve sandbox ATIF; reconstruct only from readable native output."""
+        atif_path = self.logs_dir / "trajectory.json"
+        try:
+            atif = json.loads(atif_path.read_text())
+            if (
+                isinstance(atif, dict)
+                and isinstance(atif.get("steps"), list)
+                and all(isinstance(step, dict) for step in atif["steps"])
+                and isinstance(atif.get("final_metrics", {}), (dict, type(None)))
+            ):
+                return atif
+        except (OSError, ValueError):
+            pass
+        if atif_path.exists():
+            # A partial download must not overwrite the complete sandbox file
+            # when Harbor uploads host logs. Retain the bytes for diagnosis.
+            invalid_path = atif_path.with_name(f"trajectory.invalid-{uuid4().hex}.json")
+            atif_path.rename(invalid_path)
+            self.logger.warning(f"[apex-agent] unreadable ATIF retained at {invalid_path}")
+
         native_path = self.logs_dir / "trajectory.native.json"
         try:
             native = json.loads(native_path.read_text())
-        except Exception:
+            if not isinstance(native, dict) or not isinstance(native.get("messages"), list):
+                raise ValueError("native trajectory has no messages list")
+        except (OSError, ValueError):
             self.logger.warning(
                 f"[apex-agent] native trajectory missing/unreadable at "
-                f"{native_path}; writing empty ATIF"
+                f"{native_path}; no ATIF reconstructed"
             )
-            native = {"messages": []}
-        atif = convert_trajectory(native)
-        (self.logs_dir / "trajectory.json").write_text(json.dumps(atif, indent=2))
-        return atif
+            return None
+        return write_atif_trajectory(native, atif_path)
