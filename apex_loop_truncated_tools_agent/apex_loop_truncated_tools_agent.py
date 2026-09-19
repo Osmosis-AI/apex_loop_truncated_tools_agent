@@ -87,7 +87,12 @@ def _cost_from_call(call: dict, model_name: str | None) -> float | None:
         if pricing is None and "/" in model_name:
             provider, model = model_name.split("/", 1)
             candidate = litellm.model_cost.get(model) or {}
-            if candidate.get("litellm_provider") == provider:
+            price_provider = candidate.get("litellm_provider") or ""
+            # Match LiteLLM's provider families without cross-provider fallbacks.
+            if price_provider == provider or (
+                provider in ("vertex_ai", "bedrock", "fireworks_ai")
+                and price_provider.startswith((provider + "-", provider + "_"))
+            ):
                 pricing = candidate
         # Some providers return zero for unregistered models. Require explicit
         # rates, and never substitute another provider's price for a route.

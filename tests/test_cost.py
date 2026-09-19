@@ -141,6 +141,50 @@ def test_bare_model_price_requires_the_same_provider(model, monkeypatch, provide
         assert cost is None
 
 
+@pytest.mark.parametrize(
+    ("model_name", "price_provider"),
+    [
+        ("vertex_ai/gemini-2.5-pro", "vertex_ai-language-models"),
+        ("bedrock/us.amazon.nova-pro-v1:0", "bedrock_converse"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("cached_tokens", "expected"), [(0, 0.0028), (600, 0.0019)]
+)
+def test_routed_provider_family_uses_bare_model_pricing(
+    model, monkeypatch, model_name, price_provider, cached_tokens, expected
+):
+    monkeypatch.delitem(litellm.model_cost, model_name, raising=False)
+    monkeypatch.setitem(
+        litellm.model_cost,
+        model_name.split("/", 1)[1],
+        {**litellm.model_cost[model], "litellm_provider": price_provider},
+    )
+    atif = convert_trajectory(
+        trajectory(
+            {
+                "prompt_tokens": 1000,
+                "completion_tokens": 100,
+                "cached_tokens": cached_tokens,
+            }
+        ),
+        model_name,
+    )
+    assert atif["steps"][0]["metrics"]["cost_usd"] == pytest.approx(expected)
+    assert atif["final_metrics"]["total_cost_usd"] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("provider", ["github", "azure_ai", "litellm_proxy"])
+def test_provider_alias_cannot_borrow_another_providers_price(provider, monkeypatch):
+    model_name = f"{provider}/gpt-4o"
+    monkeypatch.delitem(litellm.model_cost, model_name, raising=False)
+    atif = convert_trajectory(
+        trajectory({"prompt_tokens": 1000, "completion_tokens": 100}), model_name
+    )
+    assert atif["steps"][0]["metrics"].get("cost_usd") is None
+    assert atif["final_metrics"].get("total_cost_usd") is None
+
+
 def test_calculator_failure_preserves_usage(model, monkeypatch):
     def unavailable(**kwargs):
         raise ValueError("price unavailable")
