@@ -29,7 +29,7 @@ async def execute(args: argparse.Namespace) -> None:
         )
     )
     Path(args.output).write_text(result.model_dump_json(indent=2))
-    if result.status == AgentStatus.ERROR:
+    if result.status in (AgentStatus.ERROR, AgentStatus.CANCELLED):
         raise RuntimeError(f"Agent execution failed; native trajectory saved to {args.output}")
 
 

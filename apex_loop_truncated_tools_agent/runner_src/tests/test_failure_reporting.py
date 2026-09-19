@@ -1,6 +1,7 @@
 """Execution failures stay inspectable without changing model-failure semantics."""
 
 import argparse
+import asyncio
 import json
 import tempfile
 import unittest
@@ -11,13 +12,14 @@ from litellm import ModelResponse
 from litellm.exceptions import BadRequestError, RateLimitError
 
 import runner_cli
-from runner.agents.models import AgentStatus, AgentTrajectoryOutput
+from runner.agents.loop_truncated_tools_agent.main import LoopTruncatedToolsAgent
+from runner.agents.models import AgentRunInput, AgentStatus, AgentTrajectoryOutput
 from runner.utils import llm
 
 
 class FailureReportingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_native_error_raises_after_preserving_trajectory(self):
-        for status in (AgentStatus.ERROR, AgentStatus.FAILED, AgentStatus.COMPLETED):
+    async def test_native_execution_failures_raise_after_preserving_trajectory(self):
+        for status in (AgentStatus.ERROR, AgentStatus.CANCELLED, AgentStatus.FAILED, AgentStatus.COMPLETED):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 messages = [{"role": "user", "content": "Task"}]
@@ -38,7 +40,7 @@ class FailureReportingTests(unittest.IsolatedAsyncioTestCase):
                 with patch.dict("os.environ", {"APEX_MODEL_EXTRA_ARGS": ""}), patch(
                     "runner_cli.run", new=AsyncMock(return_value=result)
                 ):
-                    if status == AgentStatus.ERROR:
+                    if status in (AgentStatus.ERROR, AgentStatus.CANCELLED):
                         with self.assertRaisesRegex(RuntimeError, "native trajectory saved"):
                             await runner_cli.execute(args)
                     else:
@@ -46,6 +48,21 @@ class FailureReportingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     json.loads(args.output.read_text()), json.loads(result.model_dump_json())
                 )
+
+    async def test_cancelled_loop_returns_cancelled_trajectory(self):
+        messages = [{"role": "user", "content": "Task"}]
+        agent = LoopTruncatedToolsAgent(AgentRunInput(
+            trajectory_id="test", initial_messages=messages,
+            mcp_gateway_url="http://world:8000/mcp/", mcp_gateway_auth_token=None,
+            orchestrator_model="openai/test-model", orchestrator_extra_args=None,
+            agent_config_values={},
+        ))
+        with patch.object(agent, "_initialize_tools", new=AsyncMock()), patch.object(
+            agent, "step", new=AsyncMock(side_effect=asyncio.CancelledError)
+        ):
+            result = await agent.run()
+        self.assertEqual(result.status, AgentStatus.CANCELLED)
+        self.assertEqual(result.model_dump()["messages"], messages)
 
     async def test_image_patch_limit_is_not_retried(self):
         error = BadRequestError(
