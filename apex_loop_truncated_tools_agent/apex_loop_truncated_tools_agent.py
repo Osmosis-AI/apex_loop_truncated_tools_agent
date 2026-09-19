@@ -16,6 +16,7 @@ This package exposes only the canonical 100-step truncated-loop harness.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import tarfile
@@ -67,13 +68,65 @@ def _args_obj(arguments):
         return {"_raw": str(arguments)}
 
 
-def _metrics_from_call(c):
+def _cost_from_call(call: dict, model_name: str | None) -> float | None:
+    """Estimate one call with LiteLLM's provider and context-dependent rates."""
+    if not model_name or any(
+        call.get(key) is None for key in ("prompt_tokens", "completion_tokens")
+    ):
+        return None
+    for key in (
+        "prompt_tokens", "completion_tokens", "cached_tokens", "cache_creation_tokens"
+    ):
+        value = call.get(key, 0)
+        if type(value) is not int or value < 0:
+            return None
+    try:
+        import litellm
+
+        pricing = litellm.model_cost.get(model_name)
+        if pricing is None and "/" in model_name:
+            provider, model = model_name.split("/", 1)
+            candidate = litellm.model_cost.get(model) or {}
+            price_provider = candidate.get("litellm_provider") or ""
+            # Match LiteLLM's provider families without cross-provider fallbacks.
+            if price_provider == provider or (
+                provider in ("vertex_ai", "bedrock", "fireworks_ai")
+                and price_provider.startswith((provider + "-", provider + "_"))
+            ):
+                pricing = candidate
+        # Some providers return zero for unregistered models. Require explicit
+        # rates, and never substitute another provider's price for a route.
+        required_rates = ["input_cost_per_token", "output_cost_per_token"]
+        if call.get("cached_tokens"):
+            required_rates.append("cache_read_input_token_cost")
+        if call.get("cache_creation_tokens"):
+            required_rates.append("cache_creation_input_token_cost")
+        for key in required_rates:
+            rate = (pricing or {}).get(key)
+            if type(rate) not in (int, float) or not math.isfinite(rate) or rate < 0:
+                return None
+        prompt_cost, completion_cost = litellm.cost_per_token(
+            model=model_name,
+            prompt_tokens=call["prompt_tokens"],
+            completion_tokens=call["completion_tokens"],
+            cache_read_input_tokens=call.get("cached_tokens") or 0,
+            cache_creation_input_tokens=call.get("cache_creation_tokens") or 0,
+        )
+        cost = float(prompt_cost + completion_cost)
+        return cost if math.isfinite(cost) and cost >= 0 else None
+    except Exception:
+        # Missing pricing must not turn a completed task into an agent failure.
+        return None
+
+
+def _metrics_from_call(c, model_name=None):
     if not c:
         return None
     m = {
         "prompt_tokens": c.get("prompt_tokens"),
         "completion_tokens": c.get("completion_tokens"),
         "cached_tokens": c.get("cached_tokens"),
+        "cost_usd": _cost_from_call(c, model_name),
     }
     extra = {
         k: c[k]
@@ -85,10 +138,13 @@ def _metrics_from_call(c):
     return {k: v for k, v in m.items() if v is not None or k == "extra"}
 
 
-def convert_trajectory(traj: dict) -> dict:
+def convert_trajectory(traj: dict, model_name: str | None = None) -> dict:
     """APEX-native trajectory -> ATIF (the harbor trajectory standard)."""
     messages = traj.get("messages") or []
     call_log = (traj.get("usage") or {}).get("call_log") or []
+    call_metrics = [_metrics_from_call(call, model_name) for call in call_log]
+    assistant_count = sum(msg.get("role") == "assistant" for msg in messages)
+    calls_match_steps = len(call_log) == assistant_count
 
     steps = []
     a_idx = 0
@@ -125,9 +181,13 @@ def convert_trajectory(traj: dict) -> dict:
                 )
             if atif_tcs:
                 step["tool_calls"] = atif_tcs
-            mx = _metrics_from_call(call_log[a_idx] if a_idx < len(call_log) else None)
+            mx = call_metrics[a_idx] if a_idx < len(call_metrics) else None
             if mx:
-                step["metrics"] = mx
+                # Empty-choice responses are billed but add no assistant message.
+                # Keep their cost in the total without assigning it to a wrong step.
+                step["metrics"] = {
+                    k: v for k, v in mx.items() if k != "cost_usd" or calls_match_steps
+                }
             a_idx += 1
             results = []
             j = i + 1
@@ -166,6 +226,15 @@ def convert_trajectory(traj: dict) -> dict:
         }.items()
         if v is not None
     }
+    # Sum calls, including responses without an assistant message. A partial
+    # estimate must not be presented as the entire run's cost.
+    costs = [(metrics or {}).get("cost_usd") for metrics in call_metrics]
+    if (
+        costs
+        and len(call_log) >= assistant_count
+        and all(cost is not None for cost in costs)
+    ):
+        final_metrics["total_cost_usd"] = sum(costs)
     return {
         "schema_version": "ATIF-v1.5",
         "session_id": traj.get("session_id") or "apex-agent",
@@ -218,6 +287,9 @@ class ApexLoopTruncatedToolsAgent(BaseAgent):
             else "loop_truncated_tools_agent"
         )
         self._agent_name = self._agent_config_id.replace("_", " ").title()
+        # Recorded by run() for populate_context_post_run.
+        self._run_tail = ""
+        self._return_code: int | None = None
 
     async def setup(self, environment: BaseEnvironment) -> None:
         # The world boots itself (compose sidecar, POST-healthcheck-gated) —
@@ -327,10 +399,12 @@ exit $rc
                                      timeout_sec=self._agent_timeout + 900)
         tail = "\n".join(p for p in (res.stdout, res.stderr) if p)[-2000:]
         self.logger.info(f"[apex-agent] run tail:\n{tail}")
-        context.metadata = {"tail": tail, "return_code": res.return_code}
-        # Preserve whatever trajectory exists before surfacing the failure —
-        # a crashed runner must error the trial, not grade as empty work.
-        self._write_atif_trajectory()
+        # The trajectory is converted and the context filled in
+        # populate_context_post_run: harbor calls it once /logs/agent is on the
+        # host, after a successful and after a failed run alike, but only while
+        # the context is still empty — so nothing is written to it here.
+        self._run_tail = tail
+        self._return_code = res.return_code
         if res.return_code != 0:
             raise RuntimeError(
                 f"APEX runner exited {res.return_code}"
@@ -338,12 +412,22 @@ exit $rc
             )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
-        # native is authoritative; the in-run pass may have written an empty
-        # placeholder before /logs synced. Re-convert once native is readable.
-        if (self.logs_dir / "trajectory.native.json").exists():
-            self._write_atif_trajectory()
+        """Convert the synced native trajectory to ATIF and fill the context.
 
-    def _write_atif_trajectory(self) -> None:
+        harbor invokes this after /logs/agent has been synced to the host (a
+        no-op when the environment bind-mounts it, a download otherwise), on
+        success and after a failed run, so a crashed runner still errors the
+        trial with whatever trajectory it produced preserved.
+        """
+        atif = self._write_atif_trajectory()
+        context.metadata = {"tail": self._run_tail, "return_code": self._return_code}
+        metrics = atif.get("final_metrics") or {}
+        context.n_input_tokens = metrics.get("total_prompt_tokens")
+        context.n_output_tokens = metrics.get("total_completion_tokens")
+        context.n_cache_tokens = metrics.get("total_cached_tokens")
+        context.cost_usd = metrics.get("total_cost_usd")
+
+    def _write_atif_trajectory(self) -> dict:
         """Convert the runner's native trajectory to ATIF at the standard
         path; an absent or unparseable native file yields an empty-steps
         ATIF so grading judges the absence of work instead of erroring."""
@@ -356,5 +440,6 @@ exit $rc
                 f"{native_path}; writing empty ATIF"
             )
             native = {"messages": []}
-        atif = convert_trajectory(native)
+        atif = convert_trajectory(native, self.model_name)
         (self.logs_dir / "trajectory.json").write_text(json.dumps(atif, indent=2))
+        return atif

@@ -96,6 +96,15 @@ harbor run \
 
 Replace the model with any LiteLLM-compatible `provider/model`.
 
+Harbor results and ATIF trajectories include estimated model cost calculated per call using the host Harbor environment's LiteLLM price table, including prompt caching and context-length tiers. Missing usage or unknown pricing leaves the cost unset; estimates are not provider invoices.
+
+To run the cost regression tests in a Python environment with Harbor and pytest installed:
+
+```bash
+LITELLM_LOCAL_MODEL_COST_MAP=True PYTHONPATH="$PWD/apex_loop_truncated_tools_agent" \
+  python -m pytest tests/test_cost.py
+```
+
 ## Citation
 
 ```bibtex
