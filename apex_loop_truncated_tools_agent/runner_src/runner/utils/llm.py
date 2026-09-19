@@ -620,6 +620,13 @@ def _is_non_retriable_bad_request(e: Exception) -> bool:
     """
     error_str = str(e).lower()
 
+    # OpenAI image patch limits are deterministic request-validation failures.
+    if (
+        "image you provided requires" in error_str
+        and "patches after processing, exceeding the limit" in error_str
+    ):
+        return True
+
     non_retriable_patterns = [
         # Tool count errors - be specific to avoid matching rate limits
         "tools are supported",  # "Maximum of 128 tools are supported"

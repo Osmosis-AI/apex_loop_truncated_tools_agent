@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 
 from runner.agents.loop_truncated_tools_agent.main import run
-from runner.agents.models import AgentRunInput
+from runner.agents.models import AgentRunInput, AgentStatus
 
 
 async def execute(args: argparse.Namespace) -> None:
@@ -29,6 +29,8 @@ async def execute(args: argparse.Namespace) -> None:
         )
     )
     Path(args.output).write_text(result.model_dump_json(indent=2))
+    if result.status == AgentStatus.ERROR:
+        raise RuntimeError(f"Agent execution failed; native trajectory saved to {args.output}")
 
 
 def main() -> None:
