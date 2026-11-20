@@ -24,6 +24,7 @@ import tempfile
 from pathlib import Path
 
 from harbor.agents.base import BaseAgent
+from harbor.agents.capabilities import AgentCapabilities
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
@@ -251,6 +252,8 @@ def convert_trajectory(traj: dict, model_name: str | None = None) -> dict:
 
 
 class ApexLoopTruncatedToolsAgent(BaseAgent):
+    capabilities = AgentCapabilities(mcp_servers=True)
+
     @staticmethod
     def name() -> str:
         return "apex_loop_truncated_tools_agent"
