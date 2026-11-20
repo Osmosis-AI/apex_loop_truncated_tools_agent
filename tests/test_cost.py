@@ -1,6 +1,9 @@
 """Cost regressions using LiteLLM's calculator with fixed local price entries."""
 
+import asyncio
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import litellm
 import pytest
@@ -253,6 +256,35 @@ def test_synced_native_trajectory_populates_harbor_cost(model, tmp_path):
     saved = json.loads((tmp_path / "trajectory.json").read_text())
     assert context.cost_usd == pytest.approx(0.0019)
     assert saved["final_metrics"]["total_cost_usd"] == pytest.approx(context.cost_usd)
+    assert (
+        context.n_input_tokens,
+        context.n_output_tokens,
+        context.n_cache_tokens,
+    ) == (1000, 100, 600)
+
+
+def test_run_fills_harbor_cost_on_unmounted_environment(model, tmp_path):
+    native = trajectory(
+        {"prompt_tokens": 1000, "completion_tokens": 100, "cached_tokens": 600}
+    )
+    native["status"] = "completed"
+
+    class Environment:
+        capabilities = SimpleNamespace(mounted=False)
+
+        async def exec(self, command, timeout_sec=None):
+            return SimpleNamespace(stdout="OPENAI_API_KEY=k", stderr="", return_code=0)
+
+        async def download_file(self, source, target):
+            Path(target).write_text(json.dumps(native))
+
+        async def upload_file(self, source, target):
+            pass
+
+    agent = ApexLoopTruncatedToolsAgent(logs_dir=tmp_path, model_name=model)
+    context = AgentContext()
+    asyncio.run(agent.run("task", Environment(), context))
+    assert context.cost_usd == pytest.approx(0.0019)
     assert (
         context.n_input_tokens,
         context.n_output_tokens,
