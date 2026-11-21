@@ -33,6 +33,12 @@ cd apex_loop_truncated_tools_agent
 cp .env.example .env
 ```
 
+To reproduce the leaderboard's model settings, set `APEX_MODEL_EXTRA_ARGS` in `.env`. It is a JSON object of extra LiteLLM arguments sent with every model call. When it is unset, the model runs with provider defaults (for Claude, without extended thinking). The leaderboard's Claude Opus 5.5 run used:
+
+```bash
+APEX_MODEL_EXTRA_ARGS='{"output_config": {"effort": "max"}, "thinking": {"type": "adaptive", "display": "summarized"}, "max_tokens": 128000}'
+```
+
 ### Harbor Hub
 
 Run a task:
@@ -41,8 +47,8 @@ Run a task:
 PYTHONPATH="$PWD/apex_loop_truncated_tools_agent" \
 harbor run \
   --env-file .env \
-  -d mercor/apex-agents-1-1@1.0.1 \
-  -i 128-jr-1-f7f95d92 \
+  -d mercor/apex-agents-1-1@1.1.1 \
+  -i mercor/128-jr-1-f7f95d92 \
   -a apex_loop_truncated_tools_agent:ApexLoopTruncatedToolsAgent \
   -m anthropic/claude-opus-5
 ```
@@ -53,7 +59,7 @@ Run the benchmark:
 PYTHONPATH="$PWD/apex_loop_truncated_tools_agent" \
 harbor run \
   --env-file .env \
-  -d mercor/apex-agents-1-1@1.0.1 \
+  -d mercor/apex-agents-1-1@1.1.1 \
   -a apex_loop_truncated_tools_agent:ApexLoopTruncatedToolsAgent \
   -m anthropic/claude-opus-5
 ```
@@ -66,6 +72,7 @@ images:
 ```bash
 hf download mercor/apex-agents-v1.1 \
   --repo-type dataset \
+  --revision 1.1.1 \
   --local-dir apex-agents-v1.1
 
 bash apex-agents-v1.1/environment/load_images.sh
